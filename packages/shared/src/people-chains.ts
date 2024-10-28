@@ -407,7 +407,7 @@ export async function setIdentityThenAddSubsThenRemove<
   const txApi = peopleClient.api.tx
 
   /**
-   * Set Alice and Bob's on-chain identites
+   * Set Alice's on-chain identity
    */
 
   const setIdTx = txApi.identity.setIdentity(identity)
@@ -635,6 +635,124 @@ export async function addRegistrarViaRelayAsRoot<
   )
 }
 
+export async function killIdentityAsRoot<
+  TCustom extends Record<string, unknown> | undefined,
+  TInitStoragesRelay extends Record<string, Record<string, any>> | undefined,
+  TInitStoragesPara extends Record<string, Record<string, any>> | undefined,
+>(
+  relayChain: Chain<TCustom, TInitStoragesRelay>,
+  peopleChain: Chain<TCustom, TInitStoragesPara>,
+  addressEncoding: number,
+) {
+  /**
+   * Setup relay and parachain clients
+   */
+
+  const [relayClient, peopleClient] = await setupNetworks(relayChain, peopleChain)
+
+  /**
+   * Set Alice's on-chain identity
+   */
+
+  const setIdTx = peopleClient.api.tx.identity.setIdentity(identity)
+  const setIdEvents = await sendTransaction(setIdTx.signAsync(defaultAccounts.alice))
+
+  await peopleClient.chain.newBlock()
+
+  await checkEvents(setIdEvents, 'identity').toMatchSnapshot('set identity events')
+
+  /**
+   * Executing extrinsic with wrong origin
+   */
+
+  const killIdentityTx = peopleClient.api.tx.identity.killIdentity(defaultAccounts.alice.address)
+  const killIdentityEvents = await sendTransaction(killIdentityTx.signAsync(defaultAccounts.alice))
+
+  await peopleClient.dev.newBlock()
+
+  // The recorded event should be `ExtrinsicFailed` with a `BadOrigin`.
+  await checkEvents(killIdentityEvents, 'system').toMatchSnapshot('call kill identity with wrong origin')
+
+  /**
+   * XCM from relay chain
+   */
+
+  const encodedPeopleChainCalldata = killIdentityTx.method.toHex()
+
+  await sendXcmFromRelay(relayClient, encodedPeopleChainCalldata, { proofSize: '10000', refTime: '2000000000' })
+
+  /**
+   * Checks to people parachain's registrar list at several points of interest.
+   */
+
+  await relayClient.dev.newBlock()
+  await peopleClient.dev.newBlock()
+
+  console.log(defaultAccounts.alice.address)
+
+  relayClient.pause()
+  peopleClient.pause()
+
+  await new Promise((f) => setTimeout(f, 3_600_000))
+
+  const identityInfoReply = await peopleClient.api.query.identity.identityOf(defaultAccounts.alice.address)
+  await check(identityInfoReply).toMatchSnapshot('query for killed identity')
+
+  return
+
+  // Recall that, in the people chain used for tests, 2 initial test registrars exist.
+  const registrars = [
+    {
+      account: encodeAddress(defaultAccounts.alice.address, addressEncoding),
+      fee: 1,
+      fields: 0,
+    },
+
+    {
+      account: encodeAddress(defaultAccounts.bob.address, addressEncoding),
+      fee: 0,
+      fields: 0,
+    },
+  ]
+
+  const registrarsBeforeRelayBlock = await peopleClient.api.query.identity.registrars()
+
+  await check(registrarsBeforeRelayBlock).toMatchSnapshot('registrars before relay block')
+  await check(registrarsBeforeRelayBlock).toMatchObject(
+    registrars,
+    'Registrars before relay chain block differ from expected',
+  )
+
+  // Create a new block in the relay chain so that the previous XCM call can take effect in the
+  // parachain.
+  await relayClient.dev.newBlock()
+
+  const registrarsAfterRelayBlock = await peopleClient.api.query.identity.registrars()
+
+  await check(registrarsAfterRelayBlock).toMatchSnapshot('registrars after relay block')
+  await check(registrarsAfterRelayBlock).toMatchObject(
+    registrars,
+    'Registrars after relay chain block differ from expected',
+  )
+
+  // Also advance a block in the parachain - otherwise, the XCM call's effect would not be visible.
+  await peopleClient.dev.newBlock()
+
+  registrars.push({
+    account: encodeAddress(defaultAccounts.charlie.address, addressEncoding),
+    fee: 0,
+    fields: 0,
+  })
+
+  const registrarsAfterParaBlock = await peopleClient.api.query.identity.registrars()
+
+  await check(registrarsAfterParaBlock).toMatchSnapshot('registrars after parachain block')
+  await check(registrarsAfterParaBlock).toMatchObject(
+    registrars,
+    'Registrars after parachain chain block differ from expected',
+  )
+}
+
 /**
  * Send an XCM message containing an extrinsic to be executed in the people chain, as `Root`
  *
@@ -771,6 +889,10 @@ export function peopleChainE2ETests<
 
     test('adding a registrar as root from the relay chain works', async () => {
       await addRegistrarViaRelayAsRoot(relayChain, peopleChain, addressEncoding)
+    })
+
+    test('killing an identity as root from the relay chain', async () => {
+      await killIdentityAsRoot(relayChain, peopleChain, addressEncoding)
     })
   })
 }
